@@ -66,46 +66,51 @@ class AnnotationCollection(entities.BaseEntity):
             metadata['user']['model'] = {'name': model_info['name'],
                                          'confidence': float(model_info['confidence'])}
 
-        if object_id is None:
-            # add new annotation to list
-            annotation = entities.Annotation.new(item=self.item,
-                                                 annotation_definition=annotation_definition,
-                                                 automated=automated,
-                                                 frame_num=frame_num,
-                                                 metadata=metadata,
-                                                 parent_id=parent_id)
-            self.annotations.append(annotation)
-            matched_ind = len(self.annotations) - 1
-        else:
-            # find matching element_id
-            matched_ind = [i_annotation
-                           for i_annotation, annotation in enumerate(self.annotations)
-                           if annotation.object_id == object_id]
-            if len(matched_ind) == 0:
-                # no matching object id found - create new one
+        # to support list of definitions with same parameters
+        if not isinstance(annotation_definition, list):
+            annotation_definition = [annotation_definition]
+
+        for single_definition in annotation_definition:
+            if object_id is None:
+                # add new annotation to list
                 annotation = entities.Annotation.new(item=self.item,
-                                                     annotation_definition=annotation_definition,
+                                                     annotation_definition=single_definition,
                                                      frame_num=frame_num,
                                                      automated=automated,
                                                      metadata=metadata,
-                                                     object_id=object_id,
                                                      parent_id=parent_id)
                 self.annotations.append(annotation)
                 matched_ind = len(self.annotations) - 1
-            elif len(matched_ind) == 1:
-                matched_ind = matched_ind[0]
             else:
-                raise PlatformException(error='400',
-                                        message='more than one annotation with same object id: {}'.format(object_id))
+                # find matching element_id
+                matched_ind = [i_annotation
+                               for i_annotation, annotation in enumerate(self.annotations)
+                               if annotation.object_id == object_id]
+                if len(matched_ind) == 0:
+                    # no matching object id found - create new one
+                    annotation = entities.Annotation.new(item=self.item,
+                                                         annotation_definition=single_definition,
+                                                         frame_num=frame_num,
+                                                         automated=automated,
+                                                         metadata=metadata,
+                                                         object_id=object_id,
+                                                         parent_id=parent_id)
+                    self.annotations.append(annotation)
+                    matched_ind = len(self.annotations) - 1
+                elif len(matched_ind) == 1:
+                    matched_ind = matched_ind[0]
+                else:
+                    raise PlatformException(error='400',
+                                            message='more than one annotation with same object id: {}'.format(object_id))
 
-        #  add frame if exists
-        if frame_num is not None or start_time is not None:
-            self.annotations[matched_ind].add_frames(annotation_definition=annotation_definition,
-                                                     frame_num=frame_num,
-                                                     end_frame_num=end_frame_num,
-                                                     start_time=start_time,
-                                                     end_time=end_time,
-                                                     fixed=fixed)
+            #  add frame if exists
+            if frame_num is not None or start_time is not None:
+                self.annotations[matched_ind].add_frames(annotation_definition=single_definition,
+                                                         frame_num=frame_num,
+                                                         end_frame_num=end_frame_num,
+                                                         start_time=start_time,
+                                                         end_time=end_time,
+                                                         fixed=fixed)
 
     ############
     # Plotting #
@@ -300,7 +305,7 @@ class AnnotationCollection(entities.BaseEntity):
         return self.item.annotations.upload(self.annotations)
 
     @staticmethod
-    def _json_to_annotation(item, w_json, is_video=None, fps=25):
+    def _json_to_annotation(item, w_json, is_video=None, fps=25, item_metadata=None):
         try:
             # ignore notes
             if w_json['type'] == 'note':
@@ -309,6 +314,7 @@ class AnnotationCollection(entities.BaseEntity):
             else:
                 annotation = entities.Annotation.from_json(_json=w_json,
                                                            fps=fps,
+                                                           item_metadata=item_metadata,
                                                            is_video=is_video,
                                                            item=item)
                 status = True
@@ -318,16 +324,41 @@ class AnnotationCollection(entities.BaseEntity):
         return status, annotation
 
     @classmethod
-    def from_json(cls, _json, item=None, is_video=None, fps=25):
+    def from_json(cls, _json, item=None, is_video=None, fps=25, height=None, width=None):
         if item is None:
-            if 'filename' in _json:
-                ext = os.path.splitext(_json['filename'])[-1]
-                try:
-                    is_video = 'video' in mimetypes.types_map[ext.lower()]
-                except Exception:
-                    logger.info("Unknown annotation's item type. Default item type is set to: image")
-            else:
-                logger.info("Unknown annotation's item type. Default item type is set to: image")
+            if isinstance(_json, dict):
+                metadata = _json.get('metadata', dict())
+                system_metadata = metadata.get('system', dict())
+                if is_video is None:
+                    if 'mimetype' in system_metadata:
+                        is_video = 'video' in system_metadata['mimetype']
+                    elif 'filename' in _json:
+                        ext = os.path.splitext(_json['filename'])[-1]
+                        try:
+                            is_video = 'video' in mimetypes.types_map[ext.lower()]
+                        except Exception:
+                            logger.info("Unknown annotation's item type. Default item type is set to: image")
+                    else:
+                        logger.info("Unknown annotation's item type. Default item type is set to: image")
+                if is_video:
+                    fps = system_metadata.get('fps', fps)
+                    ffmpeg_info = system_metadata.get('ffmpeg', dict())
+                    height = ffmpeg_info.get('height', None)
+                    width = ffmpeg_info.get('width', None)
+                else:
+                    fps = 0
+                    height = system_metadata.get('height', None)
+                    width = system_metadata.get('width', None)
+        else:
+            fps = item.fps
+            height = item.height
+            width = item.width
+
+        item_metadata = {
+            'fps': fps,
+            'height': height,
+            'width': width
+        }
 
         if 'annotations' in _json:
             _json = _json['annotations']
@@ -336,13 +367,21 @@ class AnnotationCollection(entities.BaseEntity):
         for i_json, single_json in enumerate(_json):
             results[i_json] = cls._json_to_annotation(item=item,
                                                       fps=fps,
+                                                      item_metadata=item_metadata,
                                                       is_video=is_video,
                                                       w_json=single_json)
         # log errors
         _ = [logger.warning(j[1]) for j in results if j[0] is False and j[1] != 'note']
+
         # return good jobs
         annotations = [j[1] for j in results if j[0] is True]
-        annotations.sort(key=lambda x: x.label)
+
+        # sort
+        if is_video:
+            annotations.sort(key=lambda x: x.start_frame)
+        else:
+            annotations.sort(key=lambda x: x.label)
+
         return cls(annotations=annotations, item=item)
 
     def from_vtt_file(self, filepath):

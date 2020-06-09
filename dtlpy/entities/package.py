@@ -1,3 +1,4 @@
+import os
 from collections import namedtuple
 import logging
 import attr
@@ -110,7 +111,8 @@ class Package(entities.BaseEntity):
                           field_names=['executions', 'services', 'projects', 'packages'])
 
         r = reps(executions=repositories.Executions(client_api=self._client_api, project=self._project),
-                 services=repositories.Services(client_api=self._client_api, package=self, project=self._project),
+                 services=repositories.Services(client_api=self._client_api, package=self, project=self._project,
+                                                project_id=self.project_id),
                  projects=repositories.Projects(client_api=self._client_api),
                  packages=repositories.Packages(client_api=self._client_api, project=self._project))
         return r
@@ -171,11 +173,28 @@ class Package(entities.BaseEntity):
         """
         return self.packages.update(package=self)
 
-    def deploy(self, service_name=None, revision=None, init_input=None, runtime=None, sdk_version=None,
-               agent_versions=None, verify=True, bot=None, pod_type=None, module_name=None, **kwargs):
+    def deploy(self, service_name=None,
+               revision=None,
+               init_input=None,
+               runtime=None,
+               sdk_version=None,
+               agent_versions=None,
+               verify=True,
+               bot=None,
+               pod_type=None,
+               module_name=None,
+               run_execution_as_process=None,
+               execution_timeout=None,
+               drain_time=None,
+               on_reset=None,
+               **kwargs):
         """
         Deploy package
 
+        :param on_reset:
+        :param drain_time:
+        :param execution_timeout:
+        :param run_execution_as_process:
         :param module_name:
         :param pod_type:
         :param bot:
@@ -190,6 +209,7 @@ class Package(entities.BaseEntity):
         """
         return self.project.packages.deploy(package=self,
                                             service_name=service_name,
+                                            project_id=self.project_id,
                                             revision=revision,
                                             init_input=init_input,
                                             runtime=runtime,
@@ -199,6 +219,10 @@ class Package(entities.BaseEntity):
                                             bot=bot,
                                             verify=verify,
                                             module_name=module_name,
+                                            run_execution_as_process=run_execution_as_process,
+                                            execution_timeout=execution_timeout,
+                                            drain_time=drain_time,
+                                            on_reset=on_reset,
                                             jwt_forward=kwargs.get('jwt_forward', None),
                                             is_global=kwargs.get('is_global', None))
 
@@ -250,116 +274,51 @@ class Package(entities.BaseEntity):
     def open_in_web(self):
         self.packages.open_in_web(package=self)
 
-
-@attr.s
-class PackageInput:
-    INPUT_TYPES = ['Json', 'Dataset', 'Item', 'Annotation']
-    type = attr.ib(type=str)
-    value = attr.ib(default=None)
-    name = attr.ib(type=str)
-
-    @name.default
-    def set_name(self):
-        if self.type == 'Item':
-            return 'item'
-        elif self.type == 'Dataset':
-            return 'dataset'
-        elif self.type == 'Annotation':
-            return 'annotation'
-        else:
-            return 'config'
-
-    # noinspection PyUnusedLocal
-    @name.validator
-    def check_name(self, attribute, value):
-        name_ok = True
-        expected_name = 'Expected name for type {} is: '.format(self.type)
-        if self.type == 'Item' and value != 'item':
-            expected_name += 'item'
-            name_ok = False
-        elif self.type == 'Dataset' and value != 'dataset':
-            expected_name += 'dataset'
-            name_ok = False
-        elif self.type == 'Annotation' and value != 'annotation':
-            expected_name += 'dataset'
-            name_ok = False
-
-        if not name_ok:
-            raise exceptions.PlatformException('400', 'Invalid input name. {}'.format(expected_name))
-
-    # noinspection PyUnusedLocal
-    @type.validator
-    def check_type(self, attribute, value):
-        if value not in self.INPUT_TYPES:
-            raise exceptions.PlatformException('400',
-                                               'Invalid input type please select from: {}'.format(self.INPUT_TYPES))
-
     @staticmethod
-    def is_json_serializable(val):
-        try:
-            json.dumps(val)
-            is_json_serializable = True
-        except Exception:
-            is_json_serializable = False
-        return is_json_serializable
-
-    # noinspection PyUnusedLocal
-    @value.validator
-    def check_value(self, attribute, value):
-        value_ok = True
-        expected_value = 'Expected value should be:'
-        if self.type == 'Json':
-            expected_value = '{} json serializable'.format(expected_value)
-            if not self.is_json_serializable(value):
-                value_ok = False
-        elif self.type == 'Dataset':
-            expected_value = '{} {{"dataset_id": <dataset id>}}'.format(expected_value)
-            if not isinstance(value, dict):
-                value_ok = False
-            else:
-                if 'dataset_id' not in value:
-                    value_ok = False
-        elif self.type == 'Item':
-            expected_value = '{} {{"dataset_id": <dataset id>, "item_id": <item id>}}'.format(expected_value)
-            if not isinstance(value, dict):
-                value_ok = False
-            else:
-                if 'item_id' not in value:
-                    value_ok = False
-                if 'dataset_id' not in value:
-                    value_ok = False
-        elif self.type == 'Annotation':
-            expected_value = '{} {{"dataset_id": <dataset id>, "item_id": <item id>, "annotation_id": <annotation id>}}'.format(
-                expected_value)
-            if not isinstance(value, dict):
-                value_ok = False
-            else:
-                if 'item_id' not in value:
-                    value_ok = False
-                if 'dataset_id' not in value:
-                    value_ok = False
-                if 'annotation_id' not in value:
-                    value_ok = False
-
-        if not value_ok and value is not None:
-            raise exceptions.PlatformException('400', 'Illegal value. {}'.format(expected_value))
-
-    def to_json(self, resource='package'):
-        if resource == 'package':
-            _json = attr.asdict(self)
-        elif resource == 'execution':
-            _json = {
-                self.name: self.value
-            }
-        else:
-            raise exceptions.PlatformException('400', 'Please select resource from: package, execution')
-
+    def _mockify_input(input_type):
+        _json = dict()
+        if input_type == 'Dataset':
+            _json.update({'dataset_id': 'id'})
+        if input_type == 'Item':
+            _json.update({'item_id': 'id', 'dataset_id': 'id'})
+        if input_type == 'Annotation':
+            _json.update({'annotation_id': 'id', 'item_id': 'id', 'dataset_id': 'id'})
         return _json
 
-    @classmethod
-    def from_json(cls, _json):
-        return cls(
-            type=_json.get('type', None),
-            value=_json.get('value', None),
-            name=_json.get('name', None)
-        )
+    def mockify(self, local_path=None, module_name=None, function_name=None):
+        if local_path is None:
+            local_path = os.getcwd()
+
+        if module_name is None:
+            if self.modules:
+                module_name = self.modules[0].name
+            else:
+                raise exceptions.PlatformException('400', 'Package has no modules')
+
+        modules = [module for module in self.modules if module.name == module_name]
+        if not modules:
+            raise exceptions.PlatformException('404', 'Module not found: {}'.format(module_name))
+        module = modules[0]
+
+        if function_name is None:
+            funcs = [func for func in module.functions]
+            if funcs:
+                func = funcs[0]
+            else:
+                raise exceptions.PlatformException('400', 'Module: {} has no functions'.format(module_name))
+        else:
+            funcs = [func for func in module.functions if func.name == function_name]
+            if not funcs:
+                raise exceptions.PlatformException('404', 'Function not found: {}'.format(function_name))
+            func = funcs[0]
+
+        mock = dict()
+        for module in self.modules:
+            mock['module_name'] = module.name
+            mock['function_name'] = func.name
+            mock['config'] = {inpt.name: self._mockify_input(input_type=inpt.type) for inpt in module.init_inputs}
+            mock['inputs'] = [{'name': inpt.name, 'value': self._mockify_input(input_type=inpt.type)} for inpt in
+                              func.inputs]
+
+        with open(os.path.join(local_path, 'mock.json'), 'w') as f:
+            json.dump(mock, f)

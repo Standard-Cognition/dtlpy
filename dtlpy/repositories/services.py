@@ -1,7 +1,9 @@
 import datetime
+import inspect
 import logging
 import json
 import os
+import tempfile
 
 from urllib.parse import urlencode
 
@@ -12,10 +14,14 @@ logger = logging.getLogger(name=__name__)
 
 
 class Services:
-    def __init__(self, client_api, project=None, package=None):
+    def __init__(self, client_api, project=None, package=None, project_id=None):
         self._client_api = client_api
         self._package = package
         self._project = project
+        if project_id is None:
+            if project is not None:
+                project_id = project.id
+        self._project_id = project_id
 
     ############
     # entities #
@@ -208,9 +214,56 @@ class Services:
             raise exceptions.PlatformException(response)
         return response.json()
 
+    def _get_bot_email(self, bot=None):
+
+        if bot is None:
+            project = self._project
+            if project is None and self._project_id is not None:
+                project = repositories.Projects(client_api=self._client_api).get(project_id=self._project_id)
+
+            if project is None:
+                raise exceptions.PlatformException(error='2001',
+                                                   message='Need project entity or bot to perform this action')
+            bots = project.bots.list()
+            if len(bots) == 0:
+                logger.info('Bot not found for project. Creating a default bot')
+                bot = project.bots.create(name='default')
+            else:
+                bot = bots[0]
+                if len(bots) > 1:
+                    logger.debug('More than one bot users. Choosing first. email: {}'.format(bots[0].email))
+
+        if isinstance(bot, str):
+            bot_email = bot
+        elif isinstance(bot, entities.Bot) or isinstance(bot, entities.User):
+            bot_email = bot.email
+        else:
+            raise ValueError('input "bot" must be a str or a Bot type, got: {}'.format(type(bot)))
+
+        return bot_email
+
+    @staticmethod
+    def _parse_init_input(init_input):
+        if not isinstance(init_input, dict):
+            if init_input is None:
+                init_input = dict()
+            else:
+                init_params = dict()
+                if not isinstance(init_input, list):
+                    init_input = [init_input]
+                for param in init_input:
+                    if isinstance(param, entities.FunctionIO):
+                        init_params.update(param.to_json(resource='service'))
+                    else:
+                        raise exceptions.PlatformException('400', 'Unknown type of init params')
+                init_input = init_params
+
+        return init_input
+
     def _create(self, service_name=None, package=None, module_name=None, bot=None, revision=None, init_input=None,
                 runtime=None, pod_type=None, project_id=None, sdk_version=None, agent_versions=None, verify=True,
-                driver_id=None, **kwargs):
+                driver_id=None, run_execution_as_process=None, execution_timeout=None, drain_time=None, on_reset=None,
+                **kwargs):
         """
         Create service entity
         :param verify:
@@ -242,60 +295,30 @@ class Services:
                 "verify": verify
             }
 
-        if self._project is None and project_id is None:
-            raise exceptions.PlatformException('400', 'Please provide project id')
-        elif project_id is None:
-            project_id = self._project.id
+        if project_id is None:
+            if self._project is None and self._project_id is None:
+                raise exceptions.PlatformException('400', 'Please provide project id')
+            elif self._project_id is not None:
+                project_id = self._project_id
+            elif self._project is not None:
+                project_id = self._project.id
 
         if package is None:
             if self._package is None:
                 raise exceptions.PlatformException('400', 'Please provide param package')
             package = self._package
+
         if module_name is None:
             module_name = entities.DEFAULT_PACKAGE_MODULE.name
         if service_name is None:
             service_name = 'default-service'
 
-        if not isinstance(init_input, dict):
-            if init_input is None:
-                init_input = dict()
-            else:
-                init_params = dict()
-                if not isinstance(init_input, list):
-                    init_input = [init_input]
-                for param in init_input:
-                    if isinstance(param, entities.FunctionIO):
-                        init_params.update(param.to_json(resource='service'))
-                    else:
-                        raise exceptions.PlatformException('400', 'Unknown type of init params')
-                init_input = init_params
-
-        if bot is None:
-            if self._project is None:
-                raise exceptions.PlatformException(error='2001',
-                                                   message='Need project entity or bot to perform this action')
-            bots = self._project.bots.list()
-            if len(bots) == 0:
-                logger.info('Bot not found for project. Creating a default bot')
-                bot = self._project.bots.create(name='default')
-            else:
-                bot = bots[0]
-                if len(bots) > 1:
-                    logger.debug('More than one bot users. Choosing first. email: {}'.format(bots[0].email))
-
-        if isinstance(bot, str):
-            bot_email = bot
-        elif isinstance(bot, entities.Bot) or isinstance(bot, entities.User):
-            bot_email = bot.email
-        else:
-            raise ValueError('input "bot" must be a str or a Bot type, got: {}'.format(type(bot)))
-
         # payload
         payload = {'name': service_name,
                    'projectId': project_id,
                    'packageId': package.id,
-                   'initParams': init_input,
-                   'botUserName': bot_email,
+                   'initParams': self._parse_init_input(init_input=init_input),
+                   'botUserName': self._get_bot_email(bot=bot),
                    'versions': agent_versions,
                    'moduleName': module_name,
                    'driverId': driver_id}
@@ -314,7 +337,12 @@ class Services:
             if 'gpu' in payload['runtime'] and payload['runtime']['gpu']:
                 pod_type = 'gpu-k80-s'
             else:
-                pod_type = 'regular-micro'
+                pod_type = 'regular-s'
+        elif 'podType' not in payload['runtime'] and payload['runtime']['podType'] != pod_type:
+            raise exceptions.PlatformException('400', 'Different pod_types given in param and in runtime.\n'
+                                                      'pod_type param = {}\n'
+                                                      'pod_type in runtime = {}'.format(pod_type,
+                                                                                        payload['runtime']['podType']))
 
         if is_global is not None:
             payload['global'] = is_global
@@ -324,6 +352,18 @@ class Services:
 
         if 'podType' not in payload['runtime']:
             payload['runtime']['podType'] = pod_type
+
+        if run_execution_as_process is not None:
+            payload['runExecutionAsProcess'] = run_execution_as_process
+
+        if drain_time is not None:
+            payload['drainTime'] = drain_time
+
+        if on_reset is not None:
+            payload['onReset'] = on_reset
+
+        if execution_timeout is not None:
+            payload['executionTimeout'] = execution_timeout
 
         # request
         success, response = self._client_api.gen_request(req_type='post',
@@ -397,11 +437,13 @@ class Services:
                                           package=package,
                                           project=self._project)
 
-    def log(self, service, size=None, checkpoint=None, start=None, end=None, follow=False,
-            execution_id=None, function_name=None, replica_id=None, system=False):
+    def log(self, service, size=None, checkpoint=None, start=None, end=None, follow=False, text=None,
+            execution_id=None, function_name=None, replica_id=None, system=False, view=True):
         """
         Get service logs
 
+        :param text:
+        :param view:
         :param system:
         :param end: iso format time
         :param start: iso format time
@@ -431,6 +473,9 @@ class Services:
         if function_name is not None:
             payload['functionName'] = function_name
 
+        if text is not None:
+            payload['text'] = text
+
         if replica_id is not None:
             payload['replicaId'] = replica_id
 
@@ -459,15 +504,20 @@ class Services:
         if not success:
             raise exceptions.PlatformException(response)
 
-        return ServiceLog(_json=response.json(),
-                          service=service,
-                          services=self,
-                          start=payload['start'],
-                          follow=follow,
-                          execution_id=execution_id,
-                          function_name=function_name,
-                          replica_id=replica_id,
-                          system=system)
+        log = ServiceLog(_json=response.json(),
+                         service=service,
+                         services=self,
+                         start=payload['start'],
+                         follow=follow,
+                         execution_id=execution_id,
+                         function_name=function_name,
+                         replica_id=replica_id,
+                         system=system)
+
+        if view:
+            log.view()
+        else:
+            return log
 
     def execute(self, service=None, service_id=None, service_name=None,
                 sync=False, function_name=None, stream_logs=False,
@@ -489,12 +539,35 @@ class Services:
                                                                           stream_logs=stream_logs)
         return execution
 
-    def deploy(self, service_name=None, package=None, bot=None, revision=None, init_input=None, runtime=None,
-               pod_type=None, sdk_version=None, agent_versions=None, verify=True, checkout=False, module_name=None,
-               project_id=None, driver_id=None, **kwargs):
+    def deploy(self,
+               service_name=None,
+               package=None,
+               bot=None,
+               revision=None,
+               init_input=None,
+               runtime=None,
+               pod_type=None,
+               sdk_version=None,
+               agent_versions=None,
+               verify=True,
+               checkout=False,
+               module_name=None,
+               project_id=None,
+               driver_id=None,
+               func=None,
+               run_execution_as_process=None,
+               execution_timeout=None,
+               drain_time=None,
+               on_reset=None,
+               **kwargs):
         """
         Deploy service
 
+        :param on_reset:
+        :param drain_time:
+        :param execution_timeout:
+        :param run_execution_as_process:
+        :param func:
         :param project_id:
         :param module_name:
         :param checkout:
@@ -511,15 +584,20 @@ class Services:
         :param sdk_version:  - optional - string - sdk version
         :return:
         """
+        if func is not None:
+            return self.__deploy_function(name=service_name, project=self._project, func=func)
+
         if init_input is not None and not isinstance(init_input, dict):
             if not isinstance(init_input, list):
                 init_input = [init_input]
 
-            if isinstance(init_input[0], entities.FunctionIO):
+            if len(init_input) > 0 and isinstance(init_input[0], entities.FunctionIO):
                 params = dict()
                 for i_param, param in enumerate(init_input):
                     params[param.name] = param.value
                 init_input = params
+            elif len(init_input) == 0:
+                init_input = None
             else:
                 raise exceptions.PlatformException(
                     error='400',
@@ -557,10 +635,71 @@ class Services:
                                    module_name=module_name,
                                    driver_id=driver_id,
                                    jwt_forward=kwargs.get('jwt_forward', None),
-                                   is_global=kwargs.get('is_global', None))
+                                   is_global=kwargs.get('is_global', None),
+                                   run_execution_as_process=run_execution_as_process,
+                                   execution_timeout=execution_timeout,
+                                   drain_time=drain_time,
+                                   on_reset=on_reset)
         if checkout:
             self.checkout(service=service)
         return service
+
+    @staticmethod
+    def __get_import_string(imports):
+        imports_string = ''
+        if imports is not None:
+            for imprt in imports:
+                as_string = ''
+                from_string = ''
+                import_from = imprt.get('from', None)
+                import_as = imprt.get('as', None)
+                import_module = imprt.get('module', None)
+                if import_from is not None:
+                    from_string = 'from {} '.format(import_from)
+                if import_as is not None:
+                    as_string = ' as {}'.format(import_as)
+                imports_string += '{}import {}{}\n'.format(from_string, import_module, as_string)
+        return imports_string
+
+    @staticmethod
+    def __get_inputs(func):
+        method = inspect.signature(func)
+        params = list(method.parameters)
+        inpts = list()
+        for arg in params:
+            if arg == 'item':
+                inpt_type = 'Item'
+            elif arg == 'dataset':
+                inpt_type = 'Dataset'
+            else:
+                inpt_type = 'Json'
+            inpts.append(entities.FunctionIO(type=inpt_type, name=arg))
+        return inpts
+
+    def __deploy_function(self, name, func, project, imports=None, is_staticmethod=True):
+        package_dir = tempfile.mkdtemp()
+        imports_string = self.__get_import_string(imports=imports)
+        main_file = os.path.join(package_dir, 'main.py')
+        with open(assets.paths.PARTIAL_MAIN_FILEPATH, 'r') as f:
+            main_string = f.read()
+        lines = inspect.getsourcelines(func)
+        method_func_string = "".join(lines[0])
+
+        with open(main_file, 'w') as f:
+            if is_staticmethod:
+                f.write('{}\n{}\n    @staticmethod\n    {}'.format(imports_string, main_string,
+                                                                   method_func_string.replace('\n', '\n    ')))
+            else:
+                f.write('{}\n{}\n    {}'.format(imports_string, main_string,
+                                                method_func_string.replace('\n', '\n    ')))
+
+        function = entities.PackageFunction(name=func.__name__, inputs=self.__get_inputs(func=func))
+        module = entities.PackageModule(functions=function, entry_point='main.py')
+        packages = repositories.Packages(client_api=self._client_api, project=project)
+        return packages.push(src_path=package_dir,
+                             package_name=name,
+                             checkout=True,
+                             modules=module).deploy(service_name=name)
 
     def deploy_from_local_folder(self, cwd=None, service_file=None, bot=None, checkout=False):
         """
@@ -603,6 +742,10 @@ class Services:
         agent_versions = service_json.get('versions', None)
         verify = service_json.get('verify', True)
         module_name = service_json.get('module_name', None)
+        run_execution_as_process = service_json.get('run_execution_as_process', None)
+        execution_timeout = service_json.get('execution_timeout', None)
+        drain_time = service_json.get('drain_time', None)
+        on_reset = service_json.get('on_reset', None)
 
         service = self.deploy(bot=bot,
                               service_name=name,
@@ -614,6 +757,10 @@ class Services:
                               agent_versions=agent_versions,
                               verify=verify,
                               checkout=checkout,
+                              run_execution_as_process=run_execution_as_process,
+                              execution_timeout=execution_timeout,
+                              drain_time=drain_time,
+                              on_reset=on_reset,
                               module_name=module_name)
 
         triggers = repositories.Triggers(client_api=self._client_api, project=self._project)
@@ -685,6 +832,10 @@ class Services:
             init_input = service_input.get('initParams', None)
             module_name = service_input.get('module_name', None)
             driver_id = service_input.get('driverId', None)
+            run_execution_as_process = service_json.get('run_execution_as_process', None)
+            execution_timeout = service_json.get('execution_timeout', None)
+            drain_time = service_json.get('drain_time', None)
+            on_reset = service_json.get('on_reset', None)
             # create or update service
             if service_input['name'] in project_services:
                 service = project_services[service_input['name']]
@@ -707,6 +858,10 @@ class Services:
                                        sdk_version=sdk_version,
                                        verify=verify,
                                        module_name=module_name,
+                                       run_execution_as_process=run_execution_as_process,
+                                       execution_timeout=execution_timeout,
+                                       drain_time=drain_time,
+                                       on_reset=on_reset,
                                        driver_id=driver_id)
                 project_services[service.name] = service
 
@@ -830,11 +985,19 @@ class ServiceLog:
                                 execution_id=self.execution_id,
                                 function_name=self.function_name,
                                 replica_id=self.replica_id,
-                                system=self.system)
+                                system=self.system,
+                                view=False)
 
         self.logs = log.logs
         self.checkpoint = log.checkpoint
         self.stop = log.stop
+
+    def view(self):
+        try:
+            for log in self:
+                print(log)
+        except KeyboardInterrupt:
+            return
 
     def __iter__(self):
         while not self.stop:

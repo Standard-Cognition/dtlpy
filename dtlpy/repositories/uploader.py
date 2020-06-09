@@ -1,6 +1,5 @@
 import validators
 import traceback
-import datetime
 import tempfile
 import requests
 import asyncio
@@ -11,19 +10,21 @@ import time
 import tqdm
 import os
 import io
-import numpy as np
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 
 from .. import PlatformException, entities, repositories
+from ..services import Reporter
 
 logger = logging.getLogger(name=__name__)
 
-NUM_TRIES = 3  # try to upload 3 time before fail on item
+NUM_TRIES = 5  # try to upload 3 time before fail on item
 
 
 class UploadElement:
-    def __init__(self, element_type, buffer, remote_filepath, annotations_filepath, remote_name=None, link_dataset_id=None, item_metadata=None):
+    def __init__(self, element_type, buffer, remote_filepath, annotations_filepath, remote_name=None,
+                 link_dataset_id=None,
+                 item_metadata=None):
         self.type = element_type
         self.buffer = buffer
         self.remote_filepath = remote_filepath
@@ -50,7 +51,7 @@ class Uploader:
             remote_path=None,
             remote_name=None,
             file_types=None,
-            num_workers=32,  # deprecated
+            num_workers=None,
             overwrite=False,
             item_metadata=None
     ):
@@ -84,42 +85,56 @@ class Uploader:
             raise PlatformException(error="400", message=msg)
         if item_metadata is not None:
             if not isinstance(item_metadata, dict):
-                msg = '"item_metadata" should be a metadata dictionary. Got type: {}'.format(
-                    type(item_metadata))
+                msg = '"item_metadata" should be a metadata dictionary. Got type: {}'.format(type(item_metadata))
                 raise PlatformException(error="400", message=msg)
+        if num_workers is not None:
+            self.items_repository._client_api.num_processes = num_workers
 
         ##########################
         # Convert inputs to list #
         ##########################
         local_annotations_path_list = None
+        remote_name_list = None
         if not isinstance(local_path, list):
             local_path_list = [local_path]
-            assert isinstance(remote_name, str) or remote_name is None
-            remote_name_list = [remote_name]
+            if remote_name is not None:
+                if not isinstance(remote_name, str):
+                    raise PlatformException(error="400",
+                                            message='remote_name must be a string, got: {}'.format(type(remote_name)))
+                remote_name_list = [remote_name]
             if local_annotations_path is not None:
+                if not isinstance(local_annotations_path, str):
+                    raise PlatformException(error="400",
+                                            message='local_annotations_path must be a string, got: {}'.format(
+                                                type(local_annotations_path)))
                 local_annotations_path_list = [local_annotations_path]
         else:
             local_path_list = local_path
             if remote_name is not None:
-                assert isinstance(remote_name, list)
-                assert len(remote_name) == len(local_path_list)
+                if not isinstance(remote_name, list):
+                    raise PlatformException(error="400",
+                                            message='remote_name must be a list, got: {}'.format(type(remote_name)))
+                if not len(remote_name) == len(local_path_list):
+                    raise PlatformException(error="400",
+                                            message='remote_name and local_path_list must be of same length. '
+                                                    'Received: remote_name: {}, '
+                                                    'local_path_list: {}'.format(len(remote_name),
+                                                                                 len(local_path_list)))
                 remote_name_list = remote_name
             if local_annotations_path is not None:
-                assert len(local_annotations_path) == len(local_path_list)
+                if not len(local_annotations_path) == len(local_path_list):
+                    raise PlatformException(error="400",
+                                            message='local_annotations_path and local_path_list must be of same lenght.'
+                                                    ' Received: local_annotations_path: {}, '
+                                                    'local_path_list: {}'.format(len(local_annotations_path),
+                                                                                 len(local_path_list)))
                 local_annotations_path_list = local_annotations_path
 
         if local_annotations_path is None:
             local_annotations_path_list = [None] * len(local_path_list)
 
-        for local_path, remote_name, local_annotation_path in zip(local_path_list, remote_name_list, local_annotations_path_list):
-            if local_annotation_path is not None:
-                if remote_name is not None:
-                    remote_name_noext  = os.path.splitext(remote_name)[0]
-                    annotation_name_noext = os.path.splitext(os.path.basename(local_annotation_path))[0]
-                    assert remote_name_noext == annotation_name_noext
-                else:
-                    # TODO: check whether local_path has same file name (sauf extension) as local_annotation_path
-                    pass
+        if remote_name is None:
+            remote_name_list = [None] * len(local_path_list)
 
         elements = list()
         total_size = 0
@@ -155,13 +170,10 @@ class Uploader:
                                     remote_filepath = remote_path + os.path.relpath(filepath, os.path.dirname(
                                         upload_item_element))
                                 else:
-                                    remote_filepath = remote_path + \
-                                        os.path.relpath(
-                                            filepath, upload_item_element)
+                                    remote_filepath = remote_path + os.path.relpath(filepath, upload_item_element)
                                 element = UploadElement(element_type='file',
                                                         buffer=filepath,
-                                                        remote_filepath=remote_filepath.replace(
-                                                            "\\", "/"),
+                                                        remote_filepath=remote_filepath.replace("\\", "/"),
                                                         annotations_filepath=annotations_filepath,
                                                         item_metadata=item_metadata)
                                 elements.append(element)
@@ -205,13 +217,13 @@ class Uploader:
                                             item_metadata=item_metadata)
                     elements.append(element)
                 else:
-                    raise PlatformException(
-                        "404", "Unknown local path: {}".format(local_path))
+                    raise PlatformException("404", "Unknown local path: {}".format(local_path))
             elif isinstance(upload_item_element, entities.Item):
                 link = entities.Link(ref=upload_item_element.id, type='id', dataset_id=upload_item_element.datasetId,
                                      name='{}_link.json'.format(upload_item_element.name))
                 if remote_name is None:
                     remote_name = link.name
+
                 remote_filepath = '{}{}'.format(remote_path, remote_name)
 
                 element = UploadElement(element_type='link',
@@ -221,8 +233,10 @@ class Uploader:
                                         item_metadata=item_metadata)
                 elements.append(element)
             elif isinstance(upload_item_element, entities.Link):
-                remote_filepath = '{}{}_link.json'.format(
-                    remote_path, upload_item_element.name)
+                if remote_name is None:
+                    remote_name = upload_item_element.name
+
+                remote_filepath = '{}{}_link.json'.format(remote_path, remote_name)
 
                 element = UploadElement(element_type='link',
                                         buffer=upload_item_element,
@@ -231,27 +245,46 @@ class Uploader:
                                         item_metadata=item_metadata)
                 elements.append(element)
             elif isinstance(upload_item_element, entities.Similarity):
+                if remote_name:
+                    upload_item_element.name = remote_name
                 if upload_item_element.name is None:
-                    upload_item_element.name = '{}_similarity.json'.format(
-                        upload_item_element.ref)
-                    remote_filepath = '{}{}'.format(
-                        remote_path, upload_item_element.name)
-                else:
-                    remote_filepath = '{}{}.json'.format(
-                        remote_path, upload_item_element.name)
+                    upload_item_element.name = '{}_similarity.json'.format(upload_item_element.ref)
 
-                element = UploadElement(element_type='similarity',
+                if not upload_item_element.name.endswith('.json'):
+                    remote_filepath = '{}{}.json'.format(remote_path, upload_item_element.name)
+                else:
+                    remote_filepath = '{}{}'.format(remote_path, upload_item_element.name)
+
+                element = UploadElement(element_type='collection',
                                         buffer=upload_item_element,
                                         remote_filepath=remote_filepath,
                                         annotations_filepath=upload_annotations_element,
                                         item_metadata=item_metadata)
                 elements.append(element)
-            else:
+            elif isinstance(upload_item_element, entities.MultiView):
+                if remote_name:
+                    upload_item_element.name = remote_name
+
+                if not upload_item_element.name.endswith('.json'):
+                    upload_item_element.name = '{}.json'.format(upload_item_element.name)
+
+                remote_filepath = '{}{}'.format(remote_path, upload_item_element.name)
+                element = UploadElement(element_type='collection',
+                                        buffer=upload_item_element,
+                                        remote_filepath=remote_filepath,
+                                        annotations_filepath=upload_annotations_element,
+                                        item_metadata=item_metadata)
+                elements.append(element)
+            elif isinstance(upload_item_element, bytes) or \
+                    isinstance(upload_item_element, io.BytesIO) or \
+                    isinstance(upload_item_element, io.BufferedReader) or \
+                    isinstance(upload_item_element, io.TextIOWrapper):
                 # binary element
-                if not hasattr(upload_item_element, "name"):
-                    raise PlatformException(error="400",
-                                            message='Must put attribute "name" on buffer (with file name) '
-                                                    'when uploading buffers')
+                if not hasattr(upload_item_element, "name") and remote_name is None:
+                    raise PlatformException(
+                        error="400",
+                        message='Upload element type was bytes. Must put attribute "name" on buffer (with file name) '
+                                'when uploading buffers or providing param "remote_name"')
                 if remote_name is None:
                     remote_name = upload_item_element.name
                 remote_filepath = remote_path + remote_name
@@ -266,26 +299,28 @@ class Uploader:
                     total_size += upload_item_element.__sizeof__()
                 except Exception:
                     logger.warning("Cant get binaries size")
+            else:
+                raise PlatformException(
+                    error="400",
+                    message="Unknown element type to upload ('local_path'). received type: {}. "
+                            "known types (or list of those types): str (dir, file, url), bytes, io.BytesIO, "
+                            "io.TextIOWrapper, Dataloop.Item, Dataloop.Link, "
+                            "Dataloop.Similarity".format(type(upload_item_element)))
 
         num_files = len(elements)
         logger.info("Uploading {} items..".format(num_files))
-        output = [0 for _ in range(num_files)]
-        status = ["" for _ in range(num_files)]
-        success = [False for _ in range(num_files)]
-        errors = ["" for _ in range(num_files)]
+        reporter = Reporter(num_workers=num_files, resource=Reporter.ITEMS_UPLOAD)
         jobs = [None for _ in range(num_files)]
         disable_pbar = self.items_repository._client_api.verbose.disable_progress_bar or num_files == 1
         pbar = tqdm.tqdm(total=num_files, disable=disable_pbar)
 
         def exception_handler(loop, context):
-            logger.debug("[Asyc] Upload item caught the following exception: {}".format(
-                context['message']))
+            logger.debug("[Asyc] Upload item caught the following exception: {}".format(context['message']))
 
         loop = asyncio.new_event_loop()
         loop.set_exception_handler(exception_handler)
         asyncio.set_event_loop(loop)
-        asyncio_semaphore = asyncio.BoundedSemaphore(
-            8 * self.items_repository._client_api._num_processes)
+        asyncio_semaphore = asyncio.BoundedSemaphore(8 * self.items_repository._client_api._num_processes)
         for i_item in range(num_files):
             element = elements[i_item]
             # upload
@@ -294,39 +329,25 @@ class Uploader:
                                                              element=element,
                                                              mode=mode,
                                                              pbar=pbar,
-                                                             status=status,
-                                                             success=success,
-                                                             output=output,
-                                                             errors=errors)
+                                                             reporter=reporter)
         loop.run_until_complete(asyncio.gather(*jobs))
         loop.stop()
         loop.close()
         pbar.close()
         # summary
         logger.info("Number of total files: {}".format(num_files))
-        for action in np.unique(status):
-            n_for_action = status.count(action)
+        for action in reporter.status_list:
+            n_for_action = reporter.status_count(status=action)
             logger.info("Number of files {}: {}".format(action, n_for_action))
 
         # log error
-        errors_list = [errors[i_job]
-                       for i_job, suc in enumerate(success) if suc is False]
-        if len(errors_list) > 0:
-            log_filepath = os.path.join(os.getcwd(),
-                                        "log_{}.txt".format(datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")))
-
-            with open(log_filepath, "w") as f:
-                f.write("\n".join(errors_list))
+        errors_count = reporter.failure_count
+        if errors_count > 0:
+            log_filepath = reporter.generate_log_files()
             logger.warning("Errors in {n_error} files. See {log_filepath} for full log".format(
-                n_error=len(errors_list), log_filepath=log_filepath))
+                n_error=errors_count, log_filepath=log_filepath))
 
-        # remove empty cells
-        output = [output[i_job]
-                  for i_job, suc in enumerate(success) if suc is True]
-        if len(output) == 1:
-            output = output[0]
-
-        return output
+        return reporter.output
 
     def __create_existence_dict_worker(self, remote_existence_dict, item_remote_filepaths):
         """
@@ -351,8 +372,7 @@ class Uploader:
             for remote_path in item_remote_paths:
                 if not remote_path.endswith('/'):
                     remote_path += '/'
-                filters.add(field='filename', values={
-                            '$glob': remote_path + '*'})
+                filters.add(field='filename', values={'$glob': remote_path + '*'})
             filters.method = 'or'
             pages = self.items_repository.list(filters=filters)
 
@@ -372,8 +392,7 @@ class Uploader:
                     remote_existence_dict[item_remote_filepath] = None
 
         except Exception:
-            logger.error('{}\nCant create existence dictionary when uploading'.format(
-                traceback.format_exc()))
+            logger.error('{}\nCant create existence dictionary when uploading'.format(traceback.format_exc()))
 
     async def __single_async_upload(self,
                                     filepath,
@@ -399,8 +418,7 @@ class Uploader:
         if isinstance(filepath, str):
             # upload local file
             if not os.path.isfile(filepath):
-                raise PlatformException(
-                    error="404", message="Filepath doesnt exists. file: {}".format(filepath))
+                raise PlatformException(error="404", message="Filepath doesnt exists. file: {}".format(filepath))
             if uploaded_filename is None:
                 uploaded_filename = os.path.basename(filepath)
             if os.path.isfile(filepath):
@@ -422,7 +440,7 @@ class Uploader:
             elif isinstance(filepath, io.TextIOWrapper):
                 to_upload = filepath
             else:
-                raise PlatformException("400", "unknown file type")
+                raise PlatformException("400", "Unknown input filepath type received: {}".format(type(filepath)))
 
             if uploaded_filename is None:
                 if hasattr(filepath, "name"):
@@ -434,8 +452,7 @@ class Uploader:
             item_size = to_upload.seek(0, 2)
             to_upload.seek(0)
             item_type = 'file'
-        remote_url = "/datasets/{}/items".format(
-            self.items_repository.dataset.id)
+        remote_url = "/datasets/{}/items".format(self.items_repository.dataset.id)
         try:
             response = await self.items_repository._client_api.upload_file_async(to_upload=to_upload,
                                                                                  item_type=item_type,
@@ -458,16 +475,14 @@ class Uploader:
                                                                 dataset=self.items_repository.dataset)
             if annotations is not None:
                 try:
-                    self.__upload_annotations(
-                        annotations=annotations, item=item)
+                    self.__upload_annotations(annotations=annotations, item=item)
                 except Exception:
-                    logger.exception(
-                        'Error uploading annotations to item id: {}'.format(item.id))
+                    logger.exception('Error uploading annotations to item id: {}'.format(item.id))
         else:
             raise PlatformException(response)
         return item, response.headers.get('x-item-op', 'na')
 
-    async def __upload_single_item_wrapper(self, asyncio_semaphore, i_item, element, pbar, status, success, output, errors, mode):
+    async def __upload_single_item_wrapper(self, asyncio_semaphore, i_item, element, pbar, reporter, mode):
         async with asyncio_semaphore:
             assert isinstance(element, UploadElement)
             item = False
@@ -476,16 +491,14 @@ class Uploader:
             saved_locally = False
             temp_dir = None
             action = 'na'
-            remote_folder, remote_name = os.path.split(
-                element.remote_filepath)
+            remote_folder, remote_name = os.path.split(element.remote_filepath)
 
             if element.type == 'url':
-                saved_locally, element.buffer, temp_dir = self.url_to_data(
-                    element.buffer)
+                saved_locally, element.buffer, temp_dir = self.url_to_data(element.buffer)
             elif element.type == 'link':
                 element.buffer = self.link(ref=element.buffer.ref, dataset_id=element.buffer.dataset_id,
-                                           type=element.buffer.type)
-            elif element.type == 'similarity':
+                                           type=element.buffer.type, mimetype=element.buffer.mimetype)
+            elif element.type == 'collection':
                 element.buffer = element.buffer.to_bytes_io()
 
             for i_try in range(NUM_TRIES):
@@ -499,8 +512,7 @@ class Uploader:
                                                                     annotations=element.annotations_filepath,
                                                                     remote_path=remote_folder,
                                                                     uploaded_filename=remote_name,
-                                                                    last_try=(
-                                                                        i_try + 1) == NUM_TRIES,
+                                                                    last_try=(i_try + 1) == NUM_TRIES,
                                                                     callback=None)
                     logger.debug("Upload item: {path}. Try {i}/{n}. Success. Item id: {id}".format(path=remote_name,
                                                                                                    i=i_try + 1,
@@ -508,7 +520,7 @@ class Uploader:
                                                                                                    id=item.id))
                     if isinstance(item, entities.Item):
                         break
-                    time.sleep(0.3 * (2 ** (NUM_TRIES - 1)))
+                    time.sleep(0.3 * (2 ** i_try))
                 except Exception as e:
                     logger.debug("Upload item: {path}. Try {i}/{n}. Fail.".format(path=remote_name,
                                                                                   i=i_try + 1,
@@ -519,14 +531,16 @@ class Uploader:
                     if saved_locally and os.path.isdir(temp_dir):
                         shutil.rmtree(temp_dir)
             if item:
-                status[i_item] = action
-                output[i_item] = item
-                success[i_item] = True
+                reporter.set_index(i_item=i_item, status=action, output=item, success=True, ref=item.id)
             else:
-                status[i_item] = "error"
-                output[i_item] = remote_folder + remote_name
-                success[i_item] = False
-                errors[i_item] = "{}\n{}".format(err, trace)
+                if isinstance(element.buffer, str):
+                    ref = element.buffer
+                elif hasattr(element.buffer, "name"):
+                    ref = element.buffer.name
+                else:
+                    ref = 'Unknown'
+                reporter.set_index(i_item=i_item, status='error', output=remote_folder + remote_name, success=False,
+                                   error="{}\n{}".format(err, trace), ref=ref)
             pbar.update()
 
     @staticmethod
@@ -548,8 +562,7 @@ class Uploader:
                 raise PlatformException(
                     error="400",
                     message='MISSING "annotations" in annotations file, cant upload. item_id: {}, '
-                            "annotations_filepath: {}".format(
-                                item.id, annotations),
+                            "annotations_filepath: {}".format(item.id, annotations),
                 )
             item.annotations.upload(annotations=annotations)
 
@@ -606,10 +619,13 @@ class Uploader:
             return False
 
     @staticmethod
-    def link(ref, type, dataset_id=None):
+    def link(ref, type, mimetype=None, dataset_id=None):
 
         link_info = {'type': type,
                      'ref': ref}
+
+        if mimetype:
+            link_info['mimetype'] = mimetype
 
         if dataset_id is not None:
             link_info['datasetId'] = dataset_id

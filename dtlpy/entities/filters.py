@@ -5,15 +5,52 @@ import os
 logger = logging.getLogger(name=__name__)
 
 
+class FiltersKnownFields:
+    DIR = "dir"
+    ANNOTATED = "annotated"
+    FILENAME = "filename"
+    CREATED_AT = "createdAt"
+    UPDATED_AT = "updatedAt"
+    LABEL = "label"
+    NAME = "name"
+    HIDDEN = "hidden"
+    TYPE = 'type'
+
+
+class FiltersResource:
+    ITEM = "items"
+    ANNOTATION = "annotations"
+
+
+class FiltersOperations:
+    OR = "or"
+    AND = "and"
+    IN = "in"
+    NOT_EQUAL = "ne"
+    EQUAL = "eq"
+    GREATER_THAN = "gt"
+    LESS_THAN = "lt"
+
+
+class FiltersMethod:
+    OR = "or"
+    AND = "and"
+
+
+class FiltersOrderByDirection:
+    DESCENDING = "descending"
+    ASCENDING = "ascending"
+
+
 class Filters:
     """
     Filters entity to filter items from pages in platform
     """
 
-    def __init__(self, field=None, values=None, operator=None, method=None):
+    def __init__(self, field=None, values=None, operator=None, method=None, custom_filter=None):
         self.or_filter_list = list()
         self.and_filter_list = list()
-        self.custom_filter = None
+        self.custom_filter = custom_filter
         self.known_operators = ['or', 'and', 'in', 'ne', 'eq', 'gt', 'glob', 'lt']
         self.resource = 'items'
         self.page = 0
@@ -193,7 +230,7 @@ class Filters:
 
         return refs
 
-    def prepare(self, operation=None, update=None, query_only=False):
+    def prepare(self, operation=None, update=None, query_only=False, system_update=None, system_metadata=False):
         """
         To dictionary for platform call
         :return: dict
@@ -242,7 +279,14 @@ class Filters:
             }
         elif operation is not None:
             if operation == 'update':
-                _json[operation] = {'metadata': {'user': update}}
+                if update:
+                    _json[operation] = {'metadata': {'user': update}}
+                else:
+                    _json[operation] = dict()
+                if system_metadata and system_update:
+                    _json['systemSpace'] = True
+                    _json[operation]['metadata'] = _json[operation].get('metadata', dict())
+                    _json[operation]['metadata']['system'] = system_update
             elif operation == 'delete':
                 _json[operation] = True
                 _json.pop('sort', None)

@@ -112,7 +112,11 @@ class Decorators:
             # before the method call
             if inst.token_expired():
                 if inst.renew_token_method() is False:
-                    raise exceptions.PlatformException('600', 'Token expired, Please login.')
+                    raise exceptions.PlatformException('600', 'Token expired, Please login.'
+                                                              '\nSDK login options: dl.login(), dl.login_token(), '
+                                                              'dl.login_secret()'
+                                                              '\nCLI login options: dlp login, dlp login-token, '
+                                                              'dlp login-secret')
             # the actual method call
             result = method(inst, *args, **kwargs)
             # after the method call
@@ -189,6 +193,7 @@ class ApiClient:
         self._num_processes = num_processes
         self._thread_pools = dict()
         self._thread_pools_names = {'item.download': num_processes,
+                                    'item.status_update': num_processes,
                                     'item.page': num_processes,
                                     'annotation.upload': num_processes,
                                     'annotation.download': num_processes,
@@ -208,12 +213,19 @@ class ApiClient:
 
     @num_processes.setter
     def num_processes(self, num_processes):
+        if num_processes == self._num_processes:
+            # same number. no need to do anything
+            return
         self._num_processes = num_processes
         for pool_name in self._thread_pools_names:
             self._thread_pools_names[pool_name] = num_processes
 
         for pool in self._thread_pools:
+            # close the pool
             self._thread_pools[pool].close()
+            # wait for all processes to finish
+            self._thread_pools[pool].join()
+            # terminate pool
             self._thread_pools[pool].terminate()
 
         self._thread_pools = dict()
@@ -507,6 +519,7 @@ class ApiClient:
         headers = self.auth
         headers['User-Agent'] = requests_toolbelt.user_agent('dtlpy', __version__.version)
 
+        pbar = None
         if callback is None:
             if item_size > 10e6:
                 # size larger than 10MB
@@ -545,6 +558,8 @@ class ApiClient:
             except Exception as err:
                 response = AsyncResponseError(error=err, trace=traceback.format_exc())
             finally:
+                if pbar is not None:
+                    pbar.close()
                 with threadLock:
                     self.calls_counter.add()
         return response
@@ -754,7 +769,7 @@ class ApiClient:
         if env.startswith('http'):
             if env not in environments.keys():
                 msg = 'Unknown environment. Please add environment to SDK ("add_environment" method)'
-                logger.exception(msg)
+                logger.error(msg)
                 raise ConnectionError(msg)
         else:
             matched_env = [env_url for env_url, env_dict in environments.items() if env_dict['alias'] == env]
@@ -860,15 +875,14 @@ class ApiClient:
     def set_api_counter(self, filepath):
         self.calls_counter = CallsCounter(filepath=filepath)
 
-    def _open_in_web(self,
-                     resource_type,
-                     project_id=None,
-                     dataset_id=None,
-                     item_id=None,
-                     package_id=None,
-                     service_id=None):
+    def _get_resource_url(self,
+                          resource_type,
+                          project_id=None,
+                          dataset_id=None,
+                          item_id=None,
+                          package_id=None,
+                          service_id=None):
 
-        import webbrowser
         env = self._environments[self._environment]['alias']
         if env == 'prod':
             head = 'https://console.dataloop.ai'
@@ -893,5 +907,21 @@ class ApiClient:
             url = head + '/projects/{}/packages/{}/services/{}'.format(project_id, package_id, service_id)
         else:
             raise exceptions.PlatformException(error='400', message='Unknown resource_type: {}'.format(resource_type))
+        return url
 
+    def _open_in_web(self,
+                     resource_type,
+                     project_id=None,
+                     dataset_id=None,
+                     item_id=None,
+                     package_id=None,
+                     service_id=None):
+
+        import webbrowser
+        url = self._get_resource_url(resource_type=resource_type,
+                                     project_id=project_id,
+                                     dataset_id=dataset_id,
+                                     item_id=item_id,
+                                     package_id=package_id,
+                                     service_id=service_id)
         webbrowser.open(url=url, new=2, autoraise=True)

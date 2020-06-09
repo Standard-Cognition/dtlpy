@@ -58,19 +58,21 @@ class Executions:
             inputs = payload.get('input', dict())
             # go over all inputs and fins project id
             for key, val in inputs.items():
-                if 'dataset_id' in val:
-                    dataset_id = val['dataset_id']
-                    project_id = repositories.Datasets(
-                        client_api=self._client_api, project=self._project).get(dataset_id=dataset_id).projects[0]
+                if not isinstance(val, dict):
+                    continue
+                if 'annotation_id' in val:
+                    annotation_id = val['annotation_id']
+                    project_id = repositories.Annotations(
+                        client_api=self._client_api).get(annotation_id=annotation_id).dataset.projects[0]
                     break
                 elif 'item_id' in val:
                     item_id = val['item_id']
                     project_id = repositories.Items(client_api=self._client_api).get(item_id=item_id).dataset.projects[0]
                     break
-                elif 'annotation_id' in val:
-                    annotation_id = val['annotation_id']
-                    project_id = repositories.Annotations(
-                        client_api=self._client_api).get(annotation_id=annotation_id).dataset.projects[0]
+                elif 'dataset_id' in val:
+                    dataset_id = val['dataset_id']
+                    project_id = repositories.Datasets(
+                        client_api=self._client_api, project=self._project).get(dataset_id=dataset_id).projects[0]
                     break
             if project_id is None:
                 # if still None - get from current repository
@@ -90,7 +92,7 @@ class Executions:
                # inputs info
                resource=None, item_id=None, dataset_id=None, annotation_id=None, project_id=None,
                # execution config
-               sync=False, stream_logs=True, return_output=True):
+               sync=False, stream_logs=False, return_output=False):
         """
         Execute a function on an existing service
 
@@ -111,6 +113,14 @@ class Executions:
             if self._service is None:
                 raise exceptions.PlatformException('400', 'Please provide service id')
             service_id = self._service.id
+
+        if resource is None:
+            if annotation_id is not None:
+                resource = entities.PackageInputType.ANNOTATION
+            elif item_id is not None:
+                resource = entities.PackageInputType.ITEM
+            elif dataset_id is not None:
+                resource = entities.PackageInputType.DATASET
 
         # payload
         payload = dict()
@@ -146,6 +156,8 @@ class Executions:
 
         # request url
         url_path = '/executions/{service_id}'.format(service_id=service_id)
+        if sync and not return_output and not stream_logs:
+            url_path += '?sync=true'
         success, response = self._client_api.gen_request(req_type='post',
                                                          path=url_path,
                                                          json_req=payload)
@@ -158,7 +170,7 @@ class Executions:
                                                  client_api=self._client_api,
                                                  service=self._service)
 
-        if sync:
+        if sync and (stream_logs or return_output):
             if stream_logs:
                 thread = threading.Thread(target=self.logs,
                                           kwargs={'execution_id': execution.id,
@@ -290,6 +302,24 @@ class Executions:
             raise exceptions.PlatformException(response)
         else:
             return response.json()
+
+    def terminate(self, execution):
+        """
+        Terminate Execution
+
+        :return:
+        """
+        # request
+        success, response = self._client_api.gen_request(req_type='post',
+                                                         path='/executions/{}/terminate'.format(execution.id))
+
+        # exception handling
+        if not success:
+            raise exceptions.PlatformException(response)
+        else:
+            return entities.Execution.from_json(_json=response.json(),
+                                                service=self._service,
+                                                client_api=self._client_api)
 
     def update(self, execution):
         """
